@@ -30,7 +30,7 @@ The container runs as a non-root user and defines a `HEALTHCHECK` on
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
 REACH_DB_PATH=./data/reach.sqlite3 uvicorn app.main:app --reload
-pytest -q            # 58 tests
+pytest -q            # 67 tests
 python examples/demo.py     # end-to-end walkthrough against localhost:8000
 ```
 
@@ -150,9 +150,18 @@ offset  size  field
   active partitions, merges, writes the snapshot and result, and commits.
   Since that transaction is the only writer, no revision can land between
   pinning and snapshot storage — an answer never mixes revisions. A
-  still-valid cached answer is served from a read-only transaction.* **Invalidation**: a revision marks every snapshot that adopted a replaced
-  day with `invalidated_at` + reason; the old answer stays readable via
-  `GET /v1/snapshots/{id}` but is no longer reused.
+  still-valid cached answer is served from a read-only transaction.* **Invalidation**: a revision marks every *still-valid* snapshot that
+  adopted a replaced day with `invalidated_at` + reason, and the upload
+  receipt lists exactly those ids — a snapshot covering several replaced
+  days appears once, and snapshots invalidated by earlier revisions keep
+  their original `invalidated_at`/reason and are never re-listed. The
+  marking `UPDATE` finds its targets through a subquery (never one bound
+  parameter per snapshot), so a batch can invalidate any number of
+  snapshots without hitting SQLite's bind-parameter ceiling, and it
+  commits in the same single transaction as the partition replacement.
+  The old answer stays readable via `GET /v1/snapshots/{id}` but is no
+  longer reused; snapshots that did not adopt a replaced day stay valid
+  and their cached answers keep serving.
 * **Bit rot**: register blobs are re-validated (length, header CRC32, max
   rank) when copied into a snapshot; a mismatch returns `500
   stored_summary_corrupt` instead of a wrong estimate.
@@ -166,23 +175,40 @@ offset  size  field
 
 ```
 $ pytest -q
-58 passed
+67 passed
 ```
 
 Covered: codec round trip and every corruption mode, register-wise merge,
 estimator accuracy, error-bound math, upload/query happy paths, late-revision
-batch replacement + snapshot invalidation, stale/conflicting revisions,
-idempotency retries, precision pinning, missing-partition/inverted-range
-rejections, snapshot inspection, OpenAPI route presence, and concurrent
-queries+uploads (each snapshot matches one committed state, and a racing
-writer is blocked while a query transaction is open). `examples/demo.py` was
-also run against a live uvicorn server.
+batch replacement + snapshot invalidation, consecutive re-uploads of one UTC
+day (each receipt lists only the snapshots that revision invalidated;
+historical snapshots keep their original `invalidated_at`/reason), one
+revision invalidating 1056 still-valid snapshots in a single commit (beyond
+SQLite's classic 999 bind-parameter ceiling, verified with the connection
+variable limit forced to 999), chunked day lists for invalidation and
+long-range pinning, rollback when invalidation fails mid-batch (neither the
+partition replacement nor the invalidation takes effect), idempotent retries
+and identical re-uploads not re-invalidating, unrelated ranges keeping their
+cached answers, stale/conflicting revisions, precision pinning,
+missing-partition/inverted-range rejections, snapshot inspection, OpenAPI
+route presence, and concurrent queries+uploads (each snapshot matches one
+committed state, and a racing writer is blocked while a query transaction is
+open).
+
+`examples/demo.py` was run against a live uvicorn server (started locally;
+no Docker daemon is available in this environment): two consecutive
+re-uploads of `2026-11-02` produced receipts `[2]` then `[3]` — the snapshot
+killed by the earlier revision was never re-listed — an idempotent retry
+returned `duplicate` with an empty receipt, `/docs` and `/openapi.json`
+served 200, and 240 concurrent range queries racing ten consecutive
+re-uploads each read exactly one committed snapshot state.
 
 ## Not done / limitations
 
 * Docker and Compose files are provided but **not built or run here** (no
   Docker daemon in this environment); `docker-compose.yml` was only
-  YAML-validated.
+  YAML-validated. The live demonstration above used a locally started
+  uvicorn server with the same `REACH_DB_PATH` configuration instead.
 * Single SQLite database; there is no cross-region replication or read
   replica.
 * No authentication, tenant scoping, or rate limiting — put it behind a

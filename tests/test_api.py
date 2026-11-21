@@ -164,6 +164,73 @@ def test_identical_revision_is_unchanged_not_duplicated(client):
     assert response.json()["status"] == "unchanged"
 
 
+def test_consecutive_reuploads_receipt_lists_only_newly_invalidated(client):
+    """连续补传同一天: each receipt names only the snapshots that this
+    batch turned from valid to invalid; long-dead snapshots stay out."""
+
+    upload(client, 1, {"2026-11-01": [f"v1-{i}" for i in range(100)]})
+    first = reach(client, "2026-11-01", "2026-11-01").json()["snapshot_id"]
+
+    r2 = upload(client, 2, {"2026-11-01": [f"v2-{i}" for i in range(100)]}).json()
+    assert r2["invalidated_snapshots"] == [first]
+
+    second = reach(client, "2026-11-01", "2026-11-01").json()["snapshot_id"]
+    r3 = upload(client, 3, {"2026-11-01": [f"v3-{i}" for i in range(100)]}).json()
+    assert r3["invalidated_snapshots"] == [second]
+
+    third = reach(client, "2026-11-01", "2026-11-01").json()["snapshot_id"]
+    r4 = upload(client, 4, {"2026-11-01": [f"v4-{i}" for i in range(100)]}).json()
+    assert r4["invalidated_snapshots"] == [third]
+
+    # Historical snapshots stay queryable with their original stamp/reason.
+    stale = client.get(f"/v1/snapshots/{first}").json()
+    assert stale["still_valid"] is False
+    assert stale["invalidation_reason"] == "revision 2 replaced 1 partition(s)"
+    first_stamp = stale["invalidated_at"]
+    assert first_stamp
+    # Later revisions did not touch the original invalidation timestamp.
+    assert client.get(f"/v1/snapshots/{first}").json()["invalidated_at"] == first_stamp
+
+
+def test_retry_and_identical_reupload_do_not_reinvalidate(client):
+    upload(client, 1, {"2026-11-01": ["a"]})
+    snapshot_id = reach(client, "2026-11-01", "2026-11-01").json()["snapshot_id"]
+
+    body = upload_body(2, 14, {"2026-11-01": ["b"]}, "retry-r2")
+    first = client.post("/v1/revisions", json=body).json()
+    assert first["invalidated_snapshots"] == [snapshot_id]
+    stamp = client.get(f"/v1/snapshots/{snapshot_id}").json()["invalidated_at"]
+
+    # Idempotent retry: no second invalidation, empty receipt.
+    retry = client.post("/v1/revisions", json=body).json()
+    assert retry["status"] == "duplicate"
+    assert retry["invalidated_snapshots"] == []
+
+    # Identical revision content under a different key: unchanged, no receipt.
+    same = upload(client, 2, {"2026-11-01": ["b"]}, key="other-key").json()
+    assert same["status"] == "unchanged"
+    assert same["invalidated_snapshots"] == []
+
+    # The original invalidation timestamp survived every retry.
+    assert client.get(f"/v1/snapshots/{snapshot_id}").json()["invalidated_at"] == stamp
+
+
+def test_revision_on_other_days_leaves_unrelated_cache_reusable(client):
+    upload(client, 1, {"2026-11-01": ["a"], "2026-11-02": ["b"]})
+    first = reach(client, "2026-11-01", "2026-11-01").json()
+    assert first["reused_snapshot"] is False
+
+    # A revision that only touches 2026-11-02 must not invalidate the
+    # snapshot that only adopted 2026-11-01.
+    response = upload(client, 2, {"2026-11-02": ["c"]}).json()
+    assert response["invalidated_snapshots"] == []
+
+    second = reach(client, "2026-11-01", "2026-11-01").json()
+    assert second["reused_snapshot"] is True
+    assert second["snapshot_id"] == first["snapshot_id"]
+    assert client.get(f"/v1/snapshots/{first['snapshot_id']}").json()["still_valid"] is True
+
+
 def test_idempotency_key_makes_retries_safe(client):
     body = upload_body(1, 14, {"2026-11-01": ["a"]}, "retry-key")
     first = client.post("/v1/revisions", json=body)

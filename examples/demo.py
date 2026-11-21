@@ -2,7 +2,9 @@
 
 It builds real HLL summaries with the same codec the API accepts, uploads two
 UTC days, queries them, then shows a late revision replacing one partition,
-invalidating the earlier snapshot, and a few rejections.
+invalidating the earlier snapshot, consecutive re-uploads of the same day
+(each receipt lists only the snapshots that revision actually invalidated),
+and a few rejections.
 """
 
 from __future__ import annotations
@@ -93,6 +95,56 @@ def main() -> None:
     print(
         f"query after r2 -> {status} unique≈{after['estimated_unique_users']} "
         f"partitions={[(p['partition_date'], p['revision']) for p in after['partitions_adopted']]}"
+    )
+
+    # Consecutive re-uploads of the same UTC day (连续补传): each receipt
+    # lists only the snapshots that revision turned from valid to invalid —
+    # snapshots killed by earlier revisions are not listed again.
+    second_snapshot = after["snapshot_id"]
+    for revision in (3, 4):
+        status, body = call(
+            "POST",
+            "/v1/revisions",
+            {
+                "revision": revision,
+                "precision": 14,
+                "idempotency_key": f"demo-r{revision}",
+                "partitions": [
+                    partition("2026-11-02", [f"corrected-r{revision}-{i}" for i in range(700)])
+                ],
+            },
+        )
+        print(
+            f"re-upload r{revision} -> {status} "
+            f"invalidated_snapshots={body.get('invalidated_snapshots')}"
+        )
+        status, current = call(
+            "GET", "/v1/reach?start_date=2026-11-01&end_date=2026-11-02"
+        )
+        print(f"  new snapshot after r{revision}: {current['snapshot_id']}")
+
+    status, stale = call("GET", f"/v1/snapshots/{second_snapshot}")
+    print(
+        f"snapshot {second_snapshot} history -> still_valid={stale['still_valid']} "
+        f"reason={stale['invalidation_reason']!r} invalidated_at={stale['invalidated_at']}"
+    )
+
+    # An idempotent retry of the last upload invalidates nothing again.
+    status, body = call(
+        "POST",
+        "/v1/revisions",
+        {
+            "revision": 4,
+            "precision": 14,
+            "idempotency_key": "demo-r4",
+            "partitions": [
+                partition("2026-11-02", [f"corrected-r4-{i}" for i in range(700)])
+            ],
+        },
+    )
+    print(
+        f"retry r4 -> {status} status={body.get('status')} "
+        f"invalidated_snapshots={body.get('invalidated_snapshots')}"
     )
 
     broken = base64.b64encode(b"HLL1 not a real sketch").decode()

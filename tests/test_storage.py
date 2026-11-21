@@ -5,10 +5,11 @@ from __future__ import annotations
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
+import app.db as db_module
 from app.db import (
     Database,
     InvalidRange,
@@ -277,3 +278,242 @@ def test_upload_endpoint_rejects_precision_mixing_within_store(client):
     )
     assert second.status_code == 422
     assert second.json()["error"]["code"] == "precision_conflict"
+
+
+# -- re-upload invalidation receipts ----------------------------------------
+
+
+def test_consecutive_reuploads_list_only_newly_invalidated_snapshots(tmp_path):
+    """Each receipt names only the snapshots this batch actually killed."""
+
+    db = Database(tmp_path / "db.sqlite3")
+    day = date(2026, 11, 1)
+    db.submit_revision(
+        revision=1,
+        precision=12,
+        summaries=[(day, summary(["v1"], 12))],
+        idempotency_key="r1",
+    )
+    first = db.estimate(start=day, end=day)["snapshot_id"]
+
+    r2 = db.submit_revision(
+        revision=2,
+        precision=12,
+        summaries=[(day, summary(["v2"], 12))],
+        idempotency_key="r2",
+    )
+    assert r2["invalidated_snapshots"] == [first]
+    first_record = db.snapshot(first)
+    first_stamp = first_record["invalidated_at"]
+    assert first_record["invalidation_reason"] == "revision 2 replaced 1 partition(s)"
+
+    second = db.estimate(start=day, end=day)["snapshot_id"]
+    r3 = db.submit_revision(
+        revision=3,
+        precision=12,
+        summaries=[(day, summary(["v3"], 12))],
+        idempotency_key="r3",
+    )
+    # The snapshot killed by r2 must not be listed again.
+    assert r3["invalidated_snapshots"] == [second]
+
+    third = db.estimate(start=day, end=day)["snapshot_id"]
+    r4 = db.submit_revision(
+        revision=4,
+        precision=12,
+        summaries=[(day, summary(["v4"], 12))],
+        idempotency_key="r4",
+    )
+    assert r4["invalidated_snapshots"] == [third]
+
+    # Historical snapshots keep their original invalidation time and reason.
+    assert db.snapshot(first)["invalidated_at"] == first_stamp
+    assert db.snapshot(first)["invalidation_reason"] == (
+        "revision 2 replaced 1 partition(s)"
+    )
+    assert db.snapshot(second)["invalidation_reason"] == (
+        "revision 3 replaced 1 partition(s)"
+    )
+
+
+def test_snapshot_covering_several_changed_days_is_listed_once(tmp_path):
+    db = Database(tmp_path / "db.sqlite3")
+    days = [date(2026, 11, 1) + timedelta(days=i) for i in range(3)]
+    db.submit_revision(
+        revision=1,
+        precision=12,
+        summaries=[(day, summary([f"d{day.day}"], 12)) for day in days],
+        idempotency_key="r1",
+    )
+    snapshot_id = db.estimate(start=days[0], end=days[2])["snapshot_id"]
+
+    result = db.submit_revision(
+        revision=2,
+        precision=12,
+        summaries=[
+            (days[0], summary(["new-a"], 12)),
+            (days[1], summary(["new-b"], 12)),
+        ],
+        idempotency_key="r2",
+    )
+    # The snapshot adopted two of the replaced days but appears exactly once.
+    assert result["invalidated_snapshots"] == [snapshot_id]
+    assert db.snapshot(snapshot_id)["invalidation_reason"] == (
+        "revision 2 replaced 2 partition(s)"
+    )
+
+
+def test_invalidation_scales_past_bind_parameter_ceiling(tmp_path):
+    """More still-valid snapshots than SQLite's classic 999-variable limit.
+
+    The invalidation must still commit in the same transaction as the
+    partition replacement, and the receipt must name exactly the snapshots
+    that transitioned from valid to invalid.
+    """
+
+    db = Database(tmp_path / "db.sqlite3")
+    base = date(2026, 1, 1)
+    days = [base + timedelta(days=i) for i in range(64)]
+    mid = days[31]
+    db.submit_revision(
+        revision=1,
+        precision=4,
+        summaries=[(day, summary([f"u{day.day}"], 4)) for day in days],
+        idempotency_key="seed",
+    )
+
+    # Every range that includes `mid` becomes a distinct still-valid snapshot:
+    # 32 starts * 33 ends = 1056 > 999 (the classic bind-parameter ceiling).
+    expected: set[int] = set()
+    for start in days[:32]:
+        for end in days[31:]:
+            expected.add(db.estimate(start=start, end=end)["snapshot_id"])
+    assert len(expected) == 32 * 33
+
+    # A snapshot that does not cover `mid` must survive with its cache.
+    unaffected = db.estimate(start=days[0], end=days[30])["snapshot_id"]
+
+    result = db.submit_revision(
+        revision=2,
+        precision=4,
+        summaries=[(mid, summary(["late"], 4))],
+        idempotency_key="late",
+    )
+    receipt = result["invalidated_snapshots"]
+    assert result["status"] == "accepted"
+    assert len(receipt) == len(expected)
+    assert set(receipt) == expected
+    assert len(set(receipt)) == len(receipt)
+
+    # Partition replacement and invalidation committed together.
+    active = {row["partition_date"]: row for row in db.active_partitions()}
+    assert active[mid.isoformat()]["revision"] == 2
+    assert db.snapshot(receipt[0])["still_valid"] is False
+
+    # The unaffected snapshot is still valid and its cached answer is reused.
+    assert db.snapshot(unaffected)["still_valid"] is True
+    reused = db.estimate(start=days[0], end=days[30])
+    assert reused["snapshot_id"] == unaffected
+    assert reused["reused_snapshot"] is True
+
+    # A further re-upload with no intervening query re-lists nobody.
+    again = db.submit_revision(
+        revision=3,
+        precision=4,
+        summaries=[(mid, summary(["later"], 4))],
+        idempotency_key="later",
+    )
+    assert again["invalidated_snapshots"] == []
+
+
+def test_invalidation_chunks_days_below_bind_ceiling(tmp_path, monkeypatch):
+    """Force tiny day chunks: snapshots spanning chunk boundaries are
+    invalidated and listed exactly once."""
+
+    monkeypatch.setattr(db_module, "_MAX_BIND_PARAMS", 3)
+    db = Database(tmp_path / "db.sqlite3")
+    days = [date(2026, 11, 1) + timedelta(days=i) for i in range(5)]
+    db.submit_revision(
+        revision=1,
+        precision=12,
+        summaries=[(day, summary([f"d{day.day}"], 12)) for day in days],
+        idempotency_key="r1",
+    )
+    spanning = db.estimate(start=days[0], end=days[4])["snapshot_id"]
+    head = db.estimate(start=days[0], end=days[0])["snapshot_id"]
+    tail = db.estimate(start=days[4], end=days[4])["snapshot_id"]
+
+    result = db.submit_revision(
+        revision=2,
+        precision=12,
+        summaries=[(day, summary([f"n{day.day}"], 12)) for day in days],
+        idempotency_key="r2",
+    )
+    assert result["invalidated_snapshots"] == sorted([spanning, head, tail])
+    for snapshot_id in (spanning, head, tail):
+        assert db.snapshot(snapshot_id)["still_valid"] is False
+
+
+def test_invalidation_failure_rolls_back_partition_replacement(tmp_path, monkeypatch):
+    """If the commit fails, neither the partition replacement nor the
+    snapshot invalidation may take effect."""
+
+    db = Database(tmp_path / "db.sqlite3")
+    day = date(2026, 11, 1)
+    db.submit_revision(
+        revision=1,
+        precision=12,
+        summaries=[(day, summary(["old"], 12))],
+        idempotency_key="r1",
+    )
+    snapshot_id = db.estimate(start=day, end=day)["snapshot_id"]
+
+    def boom(connection, *, days, reason, now):
+        raise RuntimeError("injected invalidation failure")
+
+    monkeypatch.setattr(db, "_invalidate_snapshots", boom)
+    with pytest.raises(RuntimeError, match="injected"):
+        db.submit_revision(
+            revision=2,
+            precision=12,
+            summaries=[(day, summary(["new"], 12))],
+            idempotency_key="r2",
+        )
+
+    active = {row["partition_date"]: row for row in db.active_partitions()}
+    assert active[day.isoformat()]["revision"] == 1
+    assert db.snapshot(snapshot_id)["still_valid"] is True
+    with sqlite3.connect(tmp_path / "db.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM partition_revisions WHERE revision = 2"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM submissions WHERE idempotency_key = 'r2'"
+        ).fetchone()[0] == 0
+
+    # The same query is still served from the still-valid cached snapshot.
+    cached = db.estimate(start=day, end=day)
+    assert cached["snapshot_id"] == snapshot_id
+    assert cached["reused_snapshot"] is True
+
+
+def test_long_range_query_chunks_pinning_below_bind_ceiling(tmp_path, monkeypatch):
+    """A range wider than the (patched) bind-parameter ceiling still pins
+    every day, in order, and still detects gaps."""
+
+    monkeypatch.setattr(db_module, "_MAX_BIND_PARAMS", 2)
+    db = Database(tmp_path / "db.sqlite3")
+    days = [date(2026, 11, 1) + timedelta(days=i) for i in range(5)]
+    db.submit_revision(
+        revision=1,
+        precision=12,
+        summaries=[(day, summary([f"d{day.day}"], 12)) for day in days],
+        idempotency_key="r1",
+    )
+    result = db.estimate(start=days[0], end=days[4])
+    assert result["partition_count"] == 5
+    assert [p["partition_date"] for p in result["partitions_adopted"]] == [
+        day.isoformat() for day in days
+    ]
+    with pytest.raises(MissingPartitions):
+        db.estimate(start=days[0], end=days[4] + timedelta(days=1))

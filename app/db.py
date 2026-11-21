@@ -14,9 +14,15 @@ Design notes
   answer in the same ``BEGIN IMMEDIATE`` transaction.  That transaction is the
   only writer, so no revision can land between pinning and snapshot storage
   and an answer never mixes pre- and post-revision state.
-* A late revision marks every snapshot that adopted one of its days as
-  invalidated.  Cached answers for invalidated snapshots are no longer
-  reused, but remain inspectable through ``GET /v1/snapshots/{id}``.
+* A late revision marks every still-valid snapshot that adopted one of its
+  days as invalidated and reports exactly those ids in the upload receipt.
+  Snapshots invalidated earlier keep their original ``invalidated_at`` and
+  reason and are not listed again.  The marking update finds its targets
+  through a subquery instead of binding one parameter per snapshot, so any
+  number of snapshots can be invalidated in the same single commit as the
+  partition replacement, regardless of SQLite's bind-parameter ceiling.
+  Cached answers for invalidated snapshots are no longer reused, but remain
+  inspectable through ``GET /v1/snapshots/{id}``.
 * Writers use ``BEGIN IMMEDIATE`` under a process lock; SQLite's single
   writer plus a busy timeout serializes uploads across processes, while WAL
   lets readers proceed concurrently.
@@ -135,6 +141,15 @@ CREATE TABLE IF NOT EXISTS service_config (
 UTC = timezone.utc
 MAX_RANGE_DAYS = 366 * 5
 
+# SQLite caps the number of parameters one statement may bind
+# (SQLITE_MAX_VARIABLE_NUMBER: 999 on builds before 3.32, higher later).
+# Statements whose ``IN`` lists scale with caller input stay well below the
+# classic ceiling by chunking at this count; statements whose matches scale
+# with the number of stored snapshots use subqueries instead of ``IN``
+# parameter lists, so they bind a constant number of parameters no matter
+# how many rows they update.
+_MAX_BIND_PARAMS = 500
+
 
 # --------------------------------------------------------------------------
 # errors
@@ -250,6 +265,13 @@ def date_range(start: date, end: date) -> list[date]:
     if span > MAX_RANGE_DAYS:
         raise InvalidRange(f"date range may not exceed {MAX_RANGE_DAYS} UTC days")
     return [start + timedelta(days=offset) for offset in range(span)]
+
+
+def _chunked(items: Sequence[str], size: int) -> Iterator[Sequence[str]]:
+    """Yield ``items`` in slices of at most ``size`` (bind-parameter cap)."""
+
+    for offset in range(0, len(items), size):
+        yield items[offset : offset + size]
 
 
 def payload_digest(
@@ -572,25 +594,46 @@ class Database:
         reason: str,
         now: str,
     ) -> list[int]:
+        """Invalidate still-valid snapshots that adopted any of ``days``.
+
+        Returns the ids that transitioned from valid to invalid *in this
+        batch* — a snapshot covering several changed days appears once, and
+        snapshots invalidated by earlier revisions keep their original
+        ``invalidated_at``/reason and are not listed again.
+
+        The UPDATE finds its targets through a subquery, so it binds
+        ``2 + len(day chunk)`` parameters no matter how many snapshots
+        match: a revision can invalidate any number of snapshots without
+        hitting SQLite's bind-parameter ceiling, and it commits in the
+        caller's single transaction together with the partition
+        replacement.  The ``invalidated_at IS NULL`` guard makes retries
+        safe: a snapshot is stamped exactly once.
+        """
+
         if not days:
             return []
-        placeholders = ",".join("?" for _ in days)
-        rows = connection.execute(
-            "SELECT DISTINCT snapshot_id FROM snapshot_partitions "
-            f"WHERE partition_date IN ({placeholders}) "
-            "ORDER BY snapshot_id",
-            [day.isoformat() for day in days],
-        ).fetchall()
-        snapshot_ids = [int(row["snapshot_id"]) for row in rows]
-        if not snapshot_ids:
-            return []
-        id_placeholders = ",".join("?" for _ in snapshot_ids)
-        connection.execute(
-            "UPDATE snapshots SET invalidated_at = ?, invalidation_reason = ? "
-            f"WHERE id IN ({id_placeholders}) AND invalidated_at IS NULL",
-            [now, reason, *snapshot_ids],
-        )
-        return snapshot_ids
+        day_strings = [day.isoformat() for day in days]
+        invalidated: list[int] = []
+        for chunk in _chunked(day_strings, _MAX_BIND_PARAMS):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = connection.execute(
+                "SELECT DISTINCT sp.snapshot_id AS snapshot_id "
+                "FROM snapshot_partitions sp "
+                "JOIN snapshots s ON s.id = sp.snapshot_id "
+                f"WHERE sp.partition_date IN ({placeholders}) "
+                "  AND s.invalidated_at IS NULL "
+                "ORDER BY sp.snapshot_id",
+                chunk,
+            ).fetchall()
+            invalidated.extend(int(row["snapshot_id"]) for row in rows)
+            connection.execute(
+                "UPDATE snapshots SET invalidated_at = ?, invalidation_reason = ? "
+                "WHERE invalidated_at IS NULL "
+                "  AND id IN (SELECT snapshot_id FROM snapshot_partitions "
+                f"            WHERE partition_date IN ({placeholders}))",
+                [now, reason, *chunk],
+            )
+        return sorted(invalidated)
 
     # -- query -----------------------------------------------------------
 
@@ -646,16 +689,25 @@ class Database:
     def _pin_active(
         self, connection: sqlite3.Connection, days: Sequence[date]
     ) -> tuple[tuple[Any, ...], ...]:
-        placeholders = ",".join("?" for _ in days)
-        rows = connection.execute(
-            "SELECT a.partition_date, a.revision, a.revision_id, r.precision, "
-            "       r.encoding_version, r.registers, r.checksum "
-            "FROM active_partitions a "
-            "JOIN partition_revisions r ON r.id = a.revision_id "
-            f"WHERE a.partition_date IN ({placeholders}) "
-            "ORDER BY a.partition_date",
-            [day.isoformat() for day in days],
-        ).fetchall()
+        # Chunked so a long range cannot exceed SQLite's bind-parameter
+        # ceiling; chunks are contiguous ascending day ranges, so the
+        # concatenated rows stay ordered by partition_date.
+        rows: list[sqlite3.Row] = []
+        day_strings = [day.isoformat() for day in days]
+        for chunk in _chunked(day_strings, _MAX_BIND_PARAMS):
+            placeholders = ",".join("?" for _ in chunk)
+            rows.extend(
+                connection.execute(
+                    "SELECT a.partition_date, a.revision, a.revision_id, "
+                    "       r.precision, r.encoding_version, r.registers, "
+                    "       r.checksum "
+                    "FROM active_partitions a "
+                    "JOIN partition_revisions r ON r.id = a.revision_id "
+                    f"WHERE a.partition_date IN ({placeholders}) "
+                    "ORDER BY a.partition_date",
+                    chunk,
+                ).fetchall()
+            )
 
         present = {row["partition_date"] for row in rows}
         missing = [day for day in days if day.isoformat() not in present]
